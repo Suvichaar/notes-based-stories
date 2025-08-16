@@ -616,7 +616,6 @@ def _voice_to_lang_tag(voice_name: str) -> str:
 
 
 def build_ssml(text: str, lang_tag: str, voice: str, rate_pct: int, pitch_semi: int, add_break_ms: int) -> str:
-    # Simple SSML; Azure supports say-as etc; keep robust.
     prosody = f'rate="{rate_pct}%" pitch="{pitch_semi}st"'
     br = f'<break time="{add_break_ms}ms"/>' if add_break_ms > 0 else ""
     # Escape basic XML entities
@@ -653,6 +652,7 @@ RECOMMENDED_KEYS = [
     *[f"s{i}image1" for i in range(1,7)],
     *[f"s{i}ssml" for i in range(1,7)],
     *[f"s{i}audio_url" for i in range(1,7)],
+    *[f"s{i}audio1" for i in range(1,7)],  # add common template alias
     "metadescription", "metakeywords", "publishedtime", "modifiedtime",
     "portraitcoverurl", "potraitcoverurl"
 ]
@@ -932,8 +932,12 @@ Respond strictly in this JSON format (keys in English; values in Target language
         for i in range(2, 7):
             text = final_json.get(f"s{i}paragraph1") or ""
             final_json[f"s{i}ssml"] = build_ssml(text, lang_tag, chosen_voice, ssml_rate, ssml_pitch, ssml_break)
+    else:
+        # make sure ssml keys exist even if not requested
+        for i in range(1, 7):
+            final_json.setdefault(f"s{i}ssml", "")
 
-    # -------- Optional: TTS from SSML --------
+    # -------- Optional: TTS (SSML preferred, with plain-text fallback) --------
     if include_tts:
         try:
             import azure.cognitiveservices.speech as speechsdk
@@ -951,50 +955,90 @@ Respond strictly in this JSON format (keys in English; values in Target language
         chosen_voice = voice_override.strip() or pick_voice_for_language(detected_lang, VOICE_NAME_DEFAULT)
         st.info(f"TTS voice: **{chosen_voice}**")
 
-        created_audio = {}
-        with st.spinner("Synthesizing audio (SSML) and uploading to S3…"):
-            ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-            base_slug = re.sub(r"[^a-z0-9\-]+", "-", (final_json.get("storytitle") or "story").lower()).strip("-")[:80] or "story"
+        def synth_and_upload(ssml_text: str, fallback_text: str, out_basename: str):
+            """Try SSML synth, then fallback to plain text synth. Return (ok, url_or_err)."""
+            ts_local = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            fname = f"{out_basename}_{ts_local}.mp3"
+            temp_path = f"__tmp_{fname}"
 
             speech_config = speechsdk.SpeechConfig(subscription=AZURE_SPEECH_KEY, region=AZURE_SPEECH_REGION)
-            speech_config.set_speech_synthesis_output_format(speechsdk.SpeechSynthesisOutputFormat.Audio48Khz192KBitRateMonoMp3)
+            speech_config.speech_synthesis_voice_name = chosen_voice
+            speech_config.set_speech_synthesis_output_format(
+                speechsdk.SpeechSynthesisOutputFormat.Audio48Khz192KBitRateMonoMp3
+            )
 
-            # Intro + slides loop
-            ssml_map = {"s1ssml": "s1audio_url"}
-            for i in range(2,7):
-                ssml_map[f"s{i}ssml"] = f"s{i}audio_url"
-
-            for ssml_key, audio_key in ssml_map.items():
-                ssml_text = final_json.get(ssml_key, "")
-                if not ssml_text:
-                    continue
-                fname = f"{base_slug}_{ts}_{ssml_key}.mp3"
-                temp_path = f"__tmp_{fname}"
-                try:
-                    audio_config = speechsdk.audio.AudioOutputConfig(filename=temp_path)
-                    synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=audio_config)
+            try:
+                audio_config = speechsdk.audio.AudioOutputConfig(filename=temp_path)
+                synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=audio_config)
+                # Prefer SSML if provided
+                if ssml_text:
                     result_tts = synthesizer.speak_ssml_async(ssml_text).get()
-                    from azure.cognitiveservices.speech import ResultReason
-                    if result_tts.reason == ResultReason.SynthesizingAudioCompleted:
+                else:
+                    result_tts = synthesizer.speak_text_async(fallback_text or "").get()
+
+                from azure.cognitiveservices.speech import ResultReason, CancellationReason
+                if result_tts.reason == ResultReason.SynthesizingAudioCompleted:
+                    s3_key = f"{S3_PREFIX.rstrip('/')}/audio/{fname}"
+                    extra_args = {"ContentType": "audio/mpeg"}
+                    s3.upload_file(temp_path, AWS_BUCKET, s3_key, ExtraArgs=extra_args)
+                    url = f"{CDN_BASE.rstrip('/')}/{s3_key}"
+                    return True, url
+
+                # If canceled or failed, log details and try fallback if we tried SSML first
+                if result_tts.reason == ResultReason.Canceled:
+                    cd = result_tts.cancellation_details
+                    st.error(f"TTS canceled ({out_basename}): reason={cd.reason}; error='{cd.error_details}'")
+                else:
+                    st.error(f"TTS failed ({out_basename}): reason={result_tts.reason}")
+
+                # Fallback path: if we attempted SSML, try plain text
+                if ssml_text and fallback_text:
+                    result2 = synthesizer.speak_text_async(fallback_text).get()
+                    if result2.reason == ResultReason.SynthesizingAudioCompleted:
                         s3_key = f"{S3_PREFIX.rstrip('/')}/audio/{fname}"
                         extra_args = {"ContentType": "audio/mpeg"}
-                        get_s3_client().upload_file(temp_path, AWS_BUCKET, s3_key, ExtraArgs=extra_args)
+                        s3.upload_file(temp_path, AWS_BUCKET, s3_key, ExtraArgs=extra_args)
                         url = f"{CDN_BASE.rstrip('/')}/{s3_key}"
-                        final_json[audio_key] = url
-                        # Back-compat alias also set (e.g., s2audio1) for templates using old naming
-                        fallback_audio1 = audio_key.replace("_url", "1")
-                        final_json[fallback_audio1] = url
-                        created_audio[ssml_key] = url
-                        st.write(f"🎧 {ssml_key} → {url}")
+                        return True, url
                     else:
-                        st.error(f"TTS failed for: {ssml_key}")
-                except Exception as e:
-                    st.error(f"TTS/Upload error for {ssml_key}: {e}")
-                finally:
-                    try:
-                        os.remove(temp_path)
-                    except Exception:
-                        pass
+                        if result2.reason == ResultReason.Canceled:
+                            cd2 = result2.cancellation_details
+                            st.error(f"Text fallback canceled ({out_basename}): reason={cd2.reason}; error='{cd2.error_details}'")
+                        else:
+                            st.error(f"Text fallback failed ({out_basename}): reason={result2.reason}")
+
+                return False, "synthesis failed"
+
+            except Exception as e:
+                return False, f"TTS error: {e}"
+            finally:
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+
+        created_audio = {}
+        with st.spinner("Synthesizing audio and uploading to S3…"):
+            base_slug = re.sub(r"[^a-z0-9\-]+", "-", (final_json.get("storytitle") or "story").lower()).strip("-")[:80] or "story"
+
+            # Ensure placeholders exist regardless of outcome
+            for i in range(1, 7):
+                final_json.setdefault(f"s{i}audio_url", "")
+                final_json.setdefault(f"s{i}audio1", "")
+
+            # Intro + slides
+            tasks = [("s1ssml", "s1audio_url", final_json.get("storytitle") or final_json.get("s1paragraph1") or "", f"{base_slug}_s1")]
+            for i in range(2, 7):
+                tasks.append((f"s{i}ssml", f"s{i}audio_url", final_json.get(f"s{i}paragraph1") or "", f"{base_slug}_s{i}"))
+
+            for ssml_key, audio_key, fallback_text, out_base in tasks:
+                ok_synth, val = synth_and_upload(final_json.get(ssml_key, ""), fallback_text, out_base)
+                if ok_synth:
+                    final_json[audio_key] = val
+                    final_json[audio_key.replace("_url", "1")] = val  # back-compat alias
+                    created_audio[ssml_key] = val
+                else:
+                    st.error(f"TTS failed for: {ssml_key} → {val}")
 
             if created_audio:
                 st.json({"audio_created": created_audio}, expanded=False)
@@ -1008,6 +1052,12 @@ Respond strictly in this JSON format (keys in English; values in Target language
 
     merged = dict(final_json)
     merged.update(extra_fields)
+
+    # ALSO pre-seed audio placeholders (prevents template warnings even if TTS off/fails)
+    for i in range(1, 7):
+        merged.setdefault(f"s{i}audio_url", "")
+        merged.setdefault(f"s{i}audio1", "")
+        merged.setdefault(f"s{i}ssml", merged.get(f"s{i}ssml", ""))
 
     # -------- Fill templates and offer downloads + S3 upload --------
     def slugify_filename(text: str) -> str:
@@ -1044,8 +1094,8 @@ Respond strictly in this JSON format (keys in English; values in Target language
                 out_filename = f"{base_name}_{ts}.html" if len(html_files) == 1 else f"{base_name}_{ts}_{idx}.html"
                 canonical_url = f"{canonical_base.rstrip('/')}/{out_filename}"
 
-                # Template fixing check (missing placeholders vs merged)
-                _, placeholders = fill_template_strict(html_text, {})  # detect placeholders
+                # Template fixing check (placeholders that aren't in data)
+                _, placeholders = fill_template_strict(html_text, {})  # detect placeholders only
                 missing_in_data = sorted([p for p in placeholders if p not in merged])
                 if missing_in_data:
                     per_file_reports.append((f.name, missing_in_data))

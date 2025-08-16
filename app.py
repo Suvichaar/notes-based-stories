@@ -189,12 +189,6 @@ Keys (English), values in detected language. If any field is missing, use an emp
   "s4paragraph1": "...",
   "s5paragraph1": "...",
   "s6paragraph1": "...",
-  "s1narration": "...",
-  "s2narration": "...",
-  "s3narration": "...",
-  "s4narration": "...",
-  "s5narration": "...",
-  "s6narration": "...",
   "s1alt1": "...",
   "s2alt1": "...",
   "s3alt1": "...",
@@ -657,7 +651,6 @@ RECOMMENDED_KEYS = [
     "storytitle",
     *[f"s{i}paragraph1" for i in range(1,7)],
     *[f"s{i}image1" for i in range(1,7)],
-    *[f"s{i}narration" for i in range(1,7)],
     *[f"s{i}ssml" for i in range(1,7)],
     *[f"s{i}audio_url" for i in range(1,7)],
     "metadescription", "metakeywords", "publishedtime", "modifiedtime",
@@ -729,10 +722,9 @@ with st.expander("🎛️ Content Quality & Subject Depth", expanded=True):
     bloom = cols2[1].selectbox("Bloom emphasis", ["Remember", "Understand", "Apply", "Analyze"], index=1)
     tone = cols2[2].selectbox("Tone", ["Neutral", "Conversational", "Exam-focused", "Teacherly"], index=1)
 
-# ---------- Narration & SSML / TTS ----------
-with st.expander("🗣️ Narration & SSML", expanded=True):
-    add_narration = st.toggle("Generate narration text for slides", value=True)
-    add_ssml = st.toggle("Generate SSML (intro + each slide narration)", value=True)
+# ---------- SSML / TTS (no narration placeholders) ----------
+with st.expander("🗣️ SSML & TTS", expanded=True):
+    add_ssml = st.toggle("Generate SSML (intro + each slide)", value=True)
     include_tts = st.toggle("Synthesize audio with Azure Speech (MP3) & upload to S3", value=True,
                             help="Requires AZURE_SPEECH_KEY and AZURE_SPEECH_REGION.")
     vcols = st.columns(4)
@@ -817,7 +809,7 @@ if run:
     target_lang = detect_hi_or_en(raw_text)
     st.info(f"Target language (auto): **{target_lang}**")
 
-    # -------- Summarize with GPT into JSON (s1..s6 + narration + s1alt..s6alt) --------
+    # -------- Summarize with GPT into JSON (s1..s6 + s1alt..s6alt) --------
     quality_addendum = f"""
 Teaching context & quality controls:
 - Subject: {subject}; Grade: {grade}; Subtopic: {subtopic or "N/A"}; Depth: {depth_level}/5
@@ -826,15 +818,7 @@ Requirements:
 - Ensure factual correctness and single coherent storyline across slides.
 - Adjust conceptual detail to depth {depth_level}/5 and difficulty '{difficulty}'.
 - Keep each slide ≤ 400 chars, concise and unambiguous.
-- {'Include' if add_narration else 'Do NOT include'} a 1–2 sentence **spoken-friendly narration** per slide (engaging, human).
 """.strip()
-
-    # Build safe, non-f-string system prompt with placeholders
-    narration_instruction = (
-        "Also produce a narration field per slide (s1narration..s6narration), 1–2 sentences, engaging and spoken-friendly."
-        if add_narration else
-        "Produce the narration keys but set them to empty strings."
-    )
 
     system_prompt = """
 You are a multilingual teaching assistant.
@@ -850,7 +834,6 @@ Your job:
 1) Extract a short and catchy title → storytitle (Target language)
 2) Summarise the content into 6 slides (s1paragraph1..s6paragraph1), each ≤ 400 characters (Target language).
 3) For each paragraph (including slide 1), write a DALL·E prompt (s1alt1..s6alt1) for a 1024x1024 flat vector illustration: bright colors, clean lines, no text/captions/logos.
-4) <<NARRATION_INSTR>>
 
 SAFETY & POSITIVITY RULES (MANDATORY):
 - If the source includes hate, harassment, violence, adult content, self-harm, illegal acts, or extremist symbols, DO NOT reproduce them.
@@ -869,12 +852,6 @@ Respond strictly in this JSON format (keys in English; values in Target language
   "s4paragraph1": "...",
   "s5paragraph1": "...",
   "s6paragraph1": "...",
-  "s1narration": "...",
-  "s2narration": "...",
-  "s3narration": "...",
-  "s4narration": "...",
-  "s5narration": "...",
-  "s6narration": "...",
   "s1alt1": "...",
   "s2alt1": "...",
   "s3alt1": "...",
@@ -882,11 +859,8 @@ Respond strictly in this JSON format (keys in English; values in Target language
   "s5alt1": "...",
   "s6alt1": "..."
 }
-Notes:
-- If narration is not requested, return empty strings for narration keys.
-""".replace("<<LANG>>", target_lang).replace("<<NARRATION_INSTR>>", narration_instruction).strip()
+""".replace("<<LANG>>", target_lang).strip()
 
-    # add a tiny style/variation hint so repeated identical inputs can still vary text a bit
     if vary_images:
         system_prompt += f"\n\nVariation hint: style='{_variation_style()}', code='{_variation_token()}'"
 
@@ -925,7 +899,7 @@ Notes:
     st.success("Structured JSON created from OCR.")
     st.json({k: result[k] for k in result if k in ["storytitle","s1paragraph1","s2paragraph1","s3paragraph1","s4paragraph1","s5paragraph1","s6paragraph1"]}, expanded=False)
 
-    # -------- NEW: Enrich alt prompts (art-director pass) --------
+    # -------- Enrich alt prompts (art-director pass) --------
     with st.spinner("Enhancing image prompts (art-director pass)…"):
         result = enrich_alt_prompts_with_model(result, detected_lang)
         if show_enriched_alts:
@@ -944,19 +918,20 @@ Notes:
             final_json["metadescription"] = meta_desc
             final_json["metakeywords"] = meta_keywords
 
-    # -------- SSML build (intro + slides) --------
-    # Use narration if available; otherwise fall back to slide paragraph text.
+    # -------- SSML build (intro + slides) — from title/paragraphs only --------
     if add_ssml:
         chosen_voice = voice_override.strip() or pick_voice_for_language(detected_lang, VOICE_NAME_DEFAULT)
         lang_tag = _voice_to_lang_tag(chosen_voice)
         st.info(f"SSML voice: **{chosen_voice}**  | lang tag: **{lang_tag}**")
-        # Intro narration best-effort (use title)
-        intro_text = final_json.get("s1narration") or final_json.get("storytitle") or ""
+
+        # s1: use title as intro
+        intro_text = final_json.get("storytitle") or final_json.get("s1paragraph1") or ""
         final_json["s1ssml"] = build_ssml(intro_text, lang_tag, chosen_voice, ssml_rate, ssml_pitch, ssml_break)
 
+        # s2..s6: slide paragraphs
         for i in range(2, 7):
-            narr = final_json.get(f"s{i}narration") or final_json.get(f"s{i}paragraph1") or ""
-            final_json[f"s{i}ssml"] = build_ssml(narr, lang_tag, chosen_voice, ssml_rate, ssml_pitch, ssml_break)
+            text = final_json.get(f"s{i}paragraph1") or ""
+            final_json[f"s{i}ssml"] = build_ssml(text, lang_tag, chosen_voice, ssml_rate, ssml_pitch, ssml_break)
 
     # -------- Optional: TTS from SSML --------
     if include_tts:
@@ -974,7 +949,6 @@ Notes:
         s3 = get_s3_client()
 
         chosen_voice = voice_override.strip() or pick_voice_for_language(detected_lang, VOICE_NAME_DEFAULT)
-        ssml_lang = _voice_to_lang_tag(chosen_voice)
         st.info(f"TTS voice: **{chosen_voice}**")
 
         created_audio = {}
@@ -1007,7 +981,7 @@ Notes:
                         get_s3_client().upload_file(temp_path, AWS_BUCKET, s3_key, ExtraArgs=extra_args)
                         url = f"{CDN_BASE.rstrip('/')}/{s3_key}"
                         final_json[audio_key] = url
-                        # Back-compat alias also set (e.g., s2audio1)
+                        # Back-compat alias also set (e.g., s2audio1) for templates using old naming
                         fallback_audio1 = audio_key.replace("_url", "1")
                         final_json[fallback_audio1] = url
                         created_audio[ssml_key] = url
@@ -1071,7 +1045,7 @@ Notes:
                 canonical_url = f"{canonical_base.rstrip('/')}/{out_filename}"
 
                 # Template fixing check (missing placeholders vs merged)
-                _, placeholders = fill_template_strict("".join(html_text), {})  # detect placeholders
+                _, placeholders = fill_template_strict(html_text, {})  # detect placeholders
                 missing_in_data = sorted([p for p in placeholders if p not in merged])
                 if missing_in_data:
                     per_file_reports.append((f.name, missing_in_data))

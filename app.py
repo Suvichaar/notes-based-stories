@@ -827,23 +827,30 @@ Requirements:
 - Adjust conceptual detail to depth {depth_level}/5 and difficulty '{difficulty}'.
 - Keep each slide ≤ 400 chars, concise and unambiguous.
 - {'Include' if add_narration else 'Do NOT include'} a 1–2 sentence **spoken-friendly narration** per slide (engaging, human).
-"""
+""".strip()
 
-    system_prompt = f"""
+    # Build safe, non-f-string system prompt with placeholders
+    narration_instruction = (
+        "Also produce a narration field per slide (s1narration..s6narration), 1–2 sentences, engaging and spoken-friendly."
+        if add_narration else
+        "Produce the narration keys but set them to empty strings."
+    )
+
+    system_prompt = """
 You are a multilingual teaching assistant.
 
 INPUT:
 - You will receive raw OCR text from notes/quiz files (could be multiple pages/files).
 
 MANDATORY:
-- Target language = "{target_lang}" (use concise BCP-47 like "en" or "hi").
+- Target language = "<<LANG>>" (use concise BCP-47 like "en" or "hi").
 - Produce ALL text fields strictly in the Target language.
 
 Your job:
 1) Extract a short and catchy title → storytitle (Target language)
 2) Summarise the content into 6 slides (s1paragraph1..s6paragraph1), each ≤ 400 characters (Target language).
 3) For each paragraph (including slide 1), write a DALL·E prompt (s1alt1..s6alt1) for a 1024x1024 flat vector illustration: bright colors, clean lines, no text/captions/logos.
-4) {'Also produce a narration field per slide (s1narration..s6narration), 1–2 sentences, engaging and spoken-friendly.' if add_narration else 'Do not add narration fields.'}
+4) <<NARRATION_INSTR>>
 
 SAFETY & POSITIVITY RULES (MANDATORY):
 - If the source includes hate, harassment, violence, adult content, self-harm, illegal acts, or extremist symbols, DO NOT reproduce them.
@@ -853,8 +860,8 @@ SAFETY & POSITIVITY RULES (MANDATORY):
 - Avoid slogans, gestures, flags, trademarks, or captions. Absolutely NO TEXT in the image.
 
 Respond strictly in this JSON format (keys in English; values in Target language):
-{{
-  "language": "{target_lang}",
+{
+  "language": "<<LANG>>",
   "storytitle": "...",
   "s1paragraph1": "...",
   "s2paragraph1": "...",
@@ -862,17 +869,22 @@ Respond strictly in this JSON format (keys in English; values in Target language
   "s4paragraph1": "...",
   "s5paragraph1": "...",
   "s6paragraph1": "...",
-  {"s1narration": "...", "s2narration": "...", "s3narration": "...", "s4narration": "...", "s5narration": "...", "s6narration": "...",}
+  "s1narration": "...",
+  "s2narration": "...",
+  "s3narration": "...",
+  "s4narration": "...",
+  "s5narration": "...",
+  "s6narration": "...",
   "s1alt1": "...",
   "s2alt1": "...",
   "s3alt1": "...",
   "s4alt1": "...",
   "s5alt1": "...",
   "s6alt1": "..."
-}}
+}
 Notes:
-- If narration is not requested, return empty strings for narration keys (or omit them).
-""".replace(",}", "}").strip()  # clean trailing comma if no narration
+- If narration is not requested, return empty strings for narration keys.
+""".replace("<<LANG>>", target_lang).replace("<<NARRATION_INSTR>>", narration_instruction).strip()
 
     # add a tiny style/variation hint so repeated identical inputs can still vary text a bit
     if vary_images:
